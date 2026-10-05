@@ -1,10 +1,10 @@
-use clap::Parser;
-use reqwest::blocking::Client;
-use serde_json::{Value, json};
-use std::io::{self, Write};
-use std::time::Duration;
+use clap::Parser; //导入解析库和“资格证
+use reqwest::blocking::Client; //create+模块+工具，同步
+use serde_json::{Value, json}; //导入库中的类型和宏，感叹号就是宏，json方便编程
+use std::io::{self, Write}; //std standard library //self帮助省略io的引入，让io和write这个资格证一起引入
+use std::time::Duration; //时间测量
 
-#[derive(Parser)]
+#[derive(Parser)] //能够自动读取，通过一个派生宏derive
 struct Args {
     #[arg(long, default_value = "http://127.0.0.1:7878")]
     url: String,
@@ -17,6 +17,19 @@ fn input(prompt: &str) -> io::Result<String> {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
     Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+}
+fn read_text() -> io::Result<String> {
+    println!("逐行输入文字，单独一行 . 表示结束（正文里想要单独一行有“.” 就敲 ..）");
+    let mut lines: Vec<String> = Vec::new();
+    loop {
+        let line = input("")?;
+        let finished = line == ".";
+        lines.push(line);
+        if finished {
+            break;
+        }
+    }
+    Ok(rm_client_sync::join_text(&lines))
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -51,7 +64,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 )
             }
-            "echo" | "delete-user" | "put" | "get" | "delete" => {
+            "echo" => {
+                body = json!({ "text": read_text()? });
+                ("POST", "/echo")
+            }
+            "delete-user" | "put" | "get" | "delete" => {
                 println!("This task is not implemented in the starting code yet.");
                 continue;
             }
