@@ -120,8 +120,12 @@ fn http_input_and_routing() {
             .status(),
         Status::BadRequest
     );
+    // Unknown path: 404. Known path with the wrong method: 405.
     assert_eq!(client.get("/missing").dispatch().status(), Status::NotFound);
-    assert_eq!(client.get("/echo").dispatch().status(), Status::NotFound);
+    assert_eq!(
+        client.get("/echo").dispatch().status(),
+        Status::MethodNotAllowed
+    );
     assert_eq!(
         client.patch("/ping").dispatch().status(),
         Status::MethodNotAllowed
@@ -133,7 +137,6 @@ fn unimplemented_routes_are_absent() {
     use rocket::http::Method;
     let client = Client::tracked(create_app()).unwrap();
     for (method, path) in [
-        (Method::Post, "/echo"),
         (Method::Delete, "/users/me"),
         (Method::Put, "/texts/note"),
         (Method::Get, "/texts/note"),
@@ -146,6 +149,7 @@ fn unimplemented_routes_are_absent() {
     }
     for path in [
         "/ping",
+        "/echo",
         "/users",
         "/sessions",
         "/sessions/current",
@@ -156,4 +160,69 @@ fn unimplemented_routes_are_absent() {
             Status::MethodNotAllowed
         );
     }
+}
+
+#[test]
+fn http_echo_returns_the_text_unchanged() {
+    let client = Client::tracked(create_app()).unwrap();
+    // No Authorization header: /echo is a public route.
+    for text in ["", "hello", "hello\nworld", "你好\n世界", "trailing\n"] {
+        let response = client
+            .post("/echo")
+            .header(ContentType::JSON)
+            .body(json!({"text": text}).to_string())
+            .dispatch();
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.into_json::<Value>().unwrap(),
+            json!({"data": text})
+        );
+    }
+}
+
+#[test]
+fn http_echo_rejects_bad_bodies() {
+    let client = Client::tracked(create_app()).unwrap();
+    for body in [
+        json!([]),
+        json!({}),
+        json!({"text": 42}),
+        json!({"text": "hi", "extra": 1}),
+    ] {
+        assert_eq!(
+            client
+                .post("/echo")
+                .header(ContentType::JSON)
+                .body(body.to_string())
+                .dispatch()
+                .status(),
+            Status::BadRequest,
+            "body {body} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn http_echo_text_limit_boundary() {
+    let client = Client::tracked(create_app()).unwrap();
+    let at_limit = json!({"text": "a".repeat(65_536)}).to_string();
+    assert_eq!(
+        client
+            .post("/echo")
+            .header(ContentType::JSON)
+            .body(at_limit)
+            .dispatch()
+            .status(),
+        Status::Ok
+    );
+    let over_limit = json!({"text": "a".repeat(65_537)}).to_string();
+    assert_eq!(
+        client
+            .post("/echo")
+            .header(ContentType::JSON)
+            .body(over_limit)
+            .dispatch()
+            .status(),
+        Status::PayloadTooLarge
+    );
 }

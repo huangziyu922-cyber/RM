@@ -11,6 +11,7 @@ use subtle::ConstantTimeEq;
 
 pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/ping"),
+    ("POST", "/echo"),
     ("POST", "/users"),
     ("POST", "/sessions"),
     ("DELETE", "/sessions/current"),
@@ -81,6 +82,21 @@ impl Service {
         }
         if method == "GET" && path == "/ping" {
             return (200, json!({"data": "pong"}));
+        }
+        if method == "POST" && path == "/echo" {
+            let Some(fields) = body.as_object() else {
+                return error(400, "Expected a JSON object");
+            };
+            let Some(text) = fields.get("text").and_then(Value::as_str) else {
+                return error(400, "Expected text");
+            };
+            if fields.len() != 1 {
+                return error(400, "Unexpected fields");
+            }
+            if text.len() > 65_536 {
+                return error(413, "Text too long");
+            }
+            return (200, json!({"data": text}));
         }
         if method == "POST" && matches!(path, "/users" | "/sessions") {
             let Some(name) = body.get("username").and_then(Value::as_str) else {
@@ -188,5 +204,43 @@ mod tests {
             service.handle("GET", "/texts", &Value::Null, &current).0,
             401
         );
+    }
+
+    #[test]
+    fn echo_returns_the_text_unchanged() {
+        let service = Service::default();
+        for text in ["", "hello", "hello\nworld", "你好\n世界", "trailing\n"] {
+            assert_eq!(
+                service.handle("POST", "/echo", &json!({ "text": text }), ""),
+                (200, json!({ "data": text }))
+            );
+        }
+    }
+
+    #[test]
+    fn echo_rejects_bodies_that_are_not_exactly_one_text_field() {
+        let service = Service::default();
+        for body in [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({ "text": 42 }),
+            json!({ "text": "hi", "extra": 1 }),
+        ] {
+            assert_eq!(
+                service.handle("POST", "/echo", &body, "").0,
+                400,
+                "{body} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn echo_text_limit_is_65536_bytes() {
+        let service = Service::default();
+        let within_limit = json!({ "text": "a".repeat(65_536) });
+        assert_eq!(service.handle("POST", "/echo", &within_limit, "").0, 200);
+        let over_limit = json!({ "text": "a".repeat(65_537) });
+        assert_eq!(service.handle("POST", "/echo", &over_limit, "").0, 413);
     }
 }
