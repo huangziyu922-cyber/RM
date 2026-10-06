@@ -1,5 +1,63 @@
 use reqwest::{Method, blocking::Client};
 use serde_json::Value;
+use std::error::Error as _;
+
+/// What went wrong with the network, as far as the client can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkError {
+    /// Nothing answered at the address: the server is down, or the address/port
+    /// is wrong.
+    Unreachable,
+    /// Something answered but took too long.
+    Timeout,
+    /// Anything else the transport reported.
+    Other,
+}
+
+impl NetworkError {
+    /// Classify a transport failure.
+    ///
+    /// The distinction matters to whoever is reading the terminal: "nothing is
+    /// listening" means start the server or fix `--url`, while "it timed out" means
+    /// the server is there but not answering. A single generic message would leave
+    /// the reader guessing.
+    pub fn of(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            return Self::Timeout;
+        }
+        // Walk the source chain: a refused connection shows up as a `ConnectionRefused`
+        // kind on some inner error, wrapped by the outer transport error.
+        let mut source: Option<&(dyn std::error::Error + 'static)> = error.source();
+        while let Some(current) = source {
+            if let Some(io) = current.downcast_ref::<std::io::Error>()
+                && io.kind() == std::io::ErrorKind::ConnectionRefused
+            {
+                return Self::Unreachable;
+            }
+            source = current.source();
+        }
+        Self::Other
+    }
+
+    /// A message that says what happened and what to do about it.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unreachable => {
+                "Could not reach the server (connection refused). Check that it is running and that --url points at it."
+            }
+            Self::Timeout => {
+                "The server did not answer in time. It may be busy or unreachable; the request can be retried."
+            }
+            Self::Other => "The request failed before any response arrived.",
+        }
+    }
+}
+
+impl std::fmt::Display for NetworkError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
 
 /// Preserve HTTP status even when the error body is not JSON.
 pub fn exchange(
@@ -59,10 +117,47 @@ pub fn keep_token(command: &str, status: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_text, keep_token};
+    use super::{NetworkError, join_text, keep_token};
 
     fn lines(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn a_network_failure_is_explained_and_never_looks_like_a_crash() {
+        for error in [
+            NetworkError::Unreachable,
+            NetworkError::Timeout,
+            NetworkError::Other,
+        ] {
+            let message = error.message();
+            assert!(!message.is_empty(), "{error:?} needs a message");
+            // `Display` and `message()` must not drift apart.
+            assert_eq!(error.to_string(), message);
+            assert_eq!(error.to_string(), error.message());
+        }
+    }
+
+    #[test]
+    fn an_unreachable_server_and_a_timeout_say_different_things() {
+        assert_ne!(
+            NetworkError::Unreachable.message(),
+            NetworkError::Timeout.message()
+        );
+        // "Nothing is listening" points at the server or the address...
+        assert!(
+            NetworkError::Unreachable
+                .message()
+                .contains("connection refused")
+        );
+        // ...while a timeout says the request may simply be retried, and neither
+        // message blames the credentials: a transport failure is not a 401.
+        assert!(NetworkError::Timeout.message().contains("did not answer"));
+        for error in [NetworkError::Unreachable, NetworkError::Timeout] {
+            let lower = error.message().to_lowercase();
+            assert!(!lower.contains("login"), "{}", error.message());
+            assert!(!lower.contains("password"), "{}", error.message());
+        }
     }
 
     #[test]

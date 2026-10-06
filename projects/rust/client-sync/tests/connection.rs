@@ -1,5 +1,5 @@
 use reqwest::{Method, blocking::Client};
-use rm_client_sync::exchange;
+use rm_client_sync::{NetworkError, exchange};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -103,6 +103,64 @@ fn delete_sends_the_token_and_no_body() {
     // DELETE must not carry a request body, so there is nothing to decode.
     assert_eq!(sent_body, "");
     assert_eq!(result, (401, json!({"message": "expired"})));
+}
+
+#[test]
+fn a_refused_connection_is_reported_as_unreachable() {
+    // A port that was just released is free, so nothing is listening there.
+    let address = {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap()
+    };
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+
+    let error = exchange(
+        &client,
+        &format!("http://{address}"),
+        Method::GET,
+        "/ping",
+        "",
+        None,
+    )
+    .expect_err("nothing is listening, so the request must fail");
+
+    assert_eq!(
+        NetworkError::of(&error),
+        NetworkError::Unreachable,
+        "a refused connection must be told apart from a timeout; raw error: {error}"
+    );
+}
+
+#[test]
+fn a_server_that_never_answers_times_out() {
+    // Accept the connection and then stay silent, so the client can only give up
+    // because of its own timeout.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let peer = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_secs(4));
+        drop(stream);
+    });
+
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(400))
+        .build()
+        .unwrap();
+    let error = exchange(&client, &url, Method::GET, "/ping", "", None)
+        .expect_err("the server never answers, so the request must fail");
+
+    assert_eq!(
+        NetworkError::of(&error),
+        NetworkError::Timeout,
+        "a silent server must classify as a timeout; raw error: {error}"
+    );
+    peer.join().unwrap();
 }
 
 #[test]

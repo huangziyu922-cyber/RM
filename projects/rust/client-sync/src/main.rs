@@ -116,7 +116,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Please log in again.");
                 }
             }
-            Err(error) => eprintln!("Request failed: {error}"),
+            Err(error) => {
+                // A transport failure is a normal event for an interactive client,
+                // not something that ends the session: report where the request
+                // stopped and wait for the next command.
+                eprintln!("{}", rm_client_sync::NetworkError::of(&error));
+                if std::env::var_os("RM_CLIENT_DEBUG").is_some() {
+                    eprintln!("(detail: {error})");
+                }
+            }
         }
     }
     Ok(())
