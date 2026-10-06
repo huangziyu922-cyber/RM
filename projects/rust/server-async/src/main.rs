@@ -1,23 +1,18 @@
 use clap::Parser;
-use rm_server_async::http::create_app;
+use rm_server_async::{Service, http};
 use std::net::SocketAddr;
 
 #[derive(Parser)]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7878")]
     address: SocketAddr,
+    /// How long a login stays valid, in seconds.
+    #[arg(long, default_value_t = rm_server_async::DEFAULT_TOKEN_TTL_SECONDS)]
+    token_ttl_seconds: u64,
 }
 
 #[rocket::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let app = create_app();
-    let config = app
-        .figment()
-        .clone()
-        .merge(("address", args.address.ip()))
-        .merge(("port", args.address.port()))
-        .merge(("log_level", "critical"));
-    app.configure(config).launch().await?;
-    Ok(())
+    http::run(args.address, Service::new(args.token_ttl_seconds)).await
 }

@@ -6,6 +6,7 @@ use rocket::route::{Handler, Outcome};
 use rocket::serde::json::Json;
 use rocket::{Build, Data, Orbit, Request, Response, Rocket, Route};
 use serde_json::Value;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -127,7 +128,12 @@ impl Handler for Dispatch {
 }
 
 pub fn create_app() -> Rocket<Build> {
-    let dispatch = Dispatch(Arc::new(Service::default()));
+    with_service(Service::default())
+}
+
+/// Inject business settings without changing the HTTP infrastructure.
+pub fn with_service(service: Service) -> Rocket<Build> {
+    let dispatch = Dispatch(Arc::new(service));
     let routes: Vec<_> = [
         Method::Get,
         Method::Post,
@@ -143,4 +149,21 @@ pub fn create_app() -> Rocket<Build> {
     .map(|method| Route::new(method, "/<_..>", dispatch.clone()))
     .collect();
     rocket::build().attach(ConsoleOutput).mount("/", routes)
+}
+
+/// Launch the server bound to `address`.
+///
+/// The async entry point: Rocket owns the runtime, and the blocking business work
+/// is moved off its worker threads by `spawn_blocking` in `Dispatch::handle`. The
+/// error is boxed so the success path of this function stays small.
+pub async fn run(address: SocketAddr, service: Service) -> Result<(), Box<dyn std::error::Error>> {
+    let app = with_service(service);
+    let config = app
+        .figment()
+        .clone()
+        .merge(("address", address.ip()))
+        .merge(("port", address.port()))
+        .merge(("log_level", "critical"));
+    app.configure(config).launch().await?;
+    Ok(())
 }
