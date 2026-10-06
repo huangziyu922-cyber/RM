@@ -15,6 +15,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/users"),
     ("POST", "/sessions"),
     ("DELETE", "/sessions/current"),
+    ("DELETE", "/users/me"),
     ("GET", "/texts"),
 ];
 
@@ -52,6 +53,13 @@ pub struct User {
 #[derive(Default)]
 pub struct Service {
     pub users: Mutex<BTreeMap<String, User>>,
+    /// Test-only pause point, invoked while logging in *after* the password has
+    /// been verified against a snapshot of the account but *before* the lock is
+    /// taken again to record the session. It exists so a test can pin the exact
+    /// interleaving the protocol requires (account deleted and re-registered during
+    /// a login) instead of hoping to hit it by timing. Never set outside tests.
+    #[cfg(test)]
+    pub(crate) after_password_check: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 pub fn error(status: u16, message: &str) -> (u16, Value) {
@@ -154,10 +162,23 @@ impl Service {
                 (user.salt, user.digest)
             };
             let digest = password_hash(password, &salt);
+            #[cfg(test)]
+            if let Some(pause) = &self.after_password_check {
+                pause();
+            }
             let mut users = self.users.lock().unwrap();
             let Some(user) = users.get_mut(name) else {
                 return error(401, "Invalid username or password");
             };
+            // `salt != salt` is not redundant with the digest comparison. The password
+            // was verified against a snapshot of this account taken before the hash was
+            // computed, and the lock was released in between. During that window the
+            // account could have been deleted (`DELETE /users/me`) and a *different*
+            // account could have registered the same username. The digest of that new
+            // account matches the submitted password too — the password is the same —
+            // so only the salt, which is regenerated on every `POST /users`, tells the
+            // two registrations apart. A login that started against the old account
+            // must not hand a session to the new one.
             if user.salt != salt || !bool::from(digest.ct_eq(&expected)) {
                 return error(401, "Invalid username or password");
             }
@@ -166,7 +187,11 @@ impl Service {
             // Later server task: record a deadline and include expires_in.
             return (200, json!({"data": {"token": token}}));
         }
-        let protected = matches!(path, "/texts" | "/sessions/current") || text_name(path).is_some();
+        // `/users/me` is protected too, but it is handled *before* the borrow below:
+        // deleting an account must remove it from the map, and the per-user handle
+        // taken there is a borrow that would still be alive at that point.
+        let protected = matches!(path, "/texts" | "/sessions/current" | "/users/me")
+            || text_name(path).is_some();
         if protected {
             let token = authorization.strip_prefix("Bearer ").unwrap_or("");
             let mut users = self.users.lock().unwrap();
@@ -177,6 +202,17 @@ impl Service {
             let Some(name) = name else {
                 return error(401, "Login required");
             };
+            // DELETE /users/me: remove the account itself, along with everything
+            // that belonged to it. Dropping the whole `User` value takes the texts
+            // and the token with it, so there is nothing left for the old identity
+            // to reach — "old token stops working" is a consequence of the account
+            // being gone, not a separate step that could be forgotten. Registering
+            // the same username afterwards creates a brand new `User` with an empty
+            // `texts` map, so no old data can reappear.
+            if method == "DELETE" && path == "/users/me" {
+                users.remove(&name);
+                return (200, json!({"data": null}));
+            }
             let user = users.get_mut(&name).unwrap();
             // Later server task: check expiry and keep authorization and state mutation atomic.
             if method == "DELETE" && path == "/sessions/current" {
@@ -252,6 +288,9 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+
     #[test]
     fn account_lifecycle() {
         let service = Service::default();
@@ -612,6 +651,143 @@ mod tests {
         assert_eq!(
             service.handle("GET", "/texts/secret", &Value::Null, &a),
             (200, json!({"data": "alice-only"}))
+        );
+    }
+
+    #[test]
+    fn deleting_an_account_takes_its_texts_and_token_with_it() {
+        let service = Service::default();
+        let auth = sign_up(&service, &alice());
+        assert_eq!(
+            service
+                .handle("PUT", "/texts/note", &json!({"text": "v1"}), &auth)
+                .0,
+            200
+        );
+        assert_eq!(
+            service.handle("GET", "/texts/note", &Value::Null, &auth),
+            (200, json!({"data": "v1"}))
+        );
+
+        assert_eq!(
+            service.handle("DELETE", "/users/me", &Value::Null, &auth),
+            (200, json!({"data": null}))
+        );
+
+        // The token was carried by the account, so removing the account removes the
+        // session too: every protected route now rejects it.
+        for (method, path) in [
+            ("GET", "/texts"),
+            ("GET", "/texts/note"),
+            ("PUT", "/texts/note"),
+            ("DELETE", "/texts/note"),
+            ("DELETE", "/sessions/current"),
+            ("DELETE", "/users/me"),
+        ] {
+            assert_eq!(
+                service
+                    .handle(method, path, &json!({"text": "v2"}), &auth)
+                    .0,
+                401,
+                "{method} {path} should reject the deleted account's token"
+            );
+        }
+
+        // Registering the same name again is allowed, and starts from nothing:
+        // no texts, and no token inherited from the old account.
+        let fresh = sign_up(&service, &alice());
+        assert_ne!(fresh, auth);
+        assert_eq!(
+            service.handle("GET", "/texts", &Value::Null, &fresh),
+            (200, json!({"data": []}))
+        );
+        assert_eq!(
+            service.handle("GET", "/texts/note", &Value::Null, &fresh).0,
+            404
+        );
+        assert_eq!(service.handle("GET", "/texts", &Value::Null, &auth).0, 401);
+    }
+
+    #[test]
+    fn a_login_that_started_before_the_account_was_recreated_does_not_apply() {
+        let mut service = Service::default();
+        let auth = sign_up(&service, &alice());
+        assert_eq!(
+            service
+                .handle("PUT", "/texts/note", &json!({"text": "v1"}), &auth)
+                .0,
+            200
+        );
+
+        // Pin the interleaving the protocol warns about instead of hoping to hit it
+        // by timing. The login starts first and parks at the point where it has
+        // already verified the password against the old account's record but has not
+        // yet recorded a session; only then is the account replaced, with the same
+        // username and the same password.
+        //
+        // The hook parks only on its first call and lets later logins through, so the
+        // test can drive one precise interleaving and then let the service work
+        // normally. Every piece has to be `Send + Sync` because `Service` is shared
+        // across threads, and a `Barrier` plus an `AtomicBool` both are.
+        let paused = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let once = Arc::new(AtomicBool::new(true));
+        service.after_password_check = Some(Box::new({
+            let (paused, resume, once) =
+                (Arc::clone(&paused), Arc::clone(&resume), Arc::clone(&once));
+            move || {
+                if once.swap(false, Ordering::SeqCst) {
+                    // Hand control to the test, and do not continue until it has
+                    // replaced the account.
+                    paused.wait();
+                    resume.wait();
+                }
+            }
+        }));
+
+        std::thread::scope(|scope| {
+            let login = scope.spawn(|| service.handle("POST", "/sessions", &alice(), "").0);
+
+            // The login is now parked inside the hook. Replace the account: delete it
+            // with the token it holds, then register the same username again, which
+            // leaves a brand new account holding no session at all.
+            paused.wait();
+            let old_token = service.users.lock().unwrap()["alice"]
+                .token
+                .clone()
+                .unwrap();
+            assert_eq!(
+                service
+                    .handle(
+                        "DELETE",
+                        "/users/me",
+                        &Value::Null,
+                        &format!("Bearer {old_token}")
+                    )
+                    .0,
+                200
+            );
+            assert_eq!(service.handle("POST", "/users", &alice(), "").0, 201);
+            assert!(service.users.lock().unwrap()["alice"].token.is_none());
+
+            // Let the stale login finish: it must refuse rather than attach a session
+            // to an account it never authenticated against.
+            resume.wait();
+            assert_eq!(login.join().unwrap(), 401);
+        });
+
+        // The decisive check: the recreated account still holds no token, so nobody
+        // is logged in through the stale login. Had it applied, a token would exist
+        // here and `sign_up` would hand out that very token.
+        assert!(service.users.lock().unwrap()["alice"].token.is_none());
+
+        // The recreated account is reachable by logging in again (it is already
+        // registered), and the texts of the deleted account are gone with it.
+        let login = service.handle("POST", "/sessions", &alice(), "").1;
+        let auth = format!("Bearer {}", login["data"]["token"].as_str().unwrap());
+        assert_eq!(
+            service.handle("GET", "/texts", &Value::Null, &auth),
+            (200, json!({"data": []}))
         );
     }
 

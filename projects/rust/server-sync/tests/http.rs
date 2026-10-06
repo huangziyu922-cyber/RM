@@ -2,7 +2,7 @@ use rm_server_sync::{
     Service,
     http::{create_app, with_service},
 };
-use rocket::http::{ContentType, Header, Status};
+use rocket::http::{ContentType, Header, Method, Status};
 use rocket::local::blocking::Client;
 use serde_json::{Value, json};
 
@@ -134,13 +134,12 @@ fn http_input_and_routing() {
 
 #[test]
 fn unimplemented_routes_are_absent() {
-    use rocket::http::Method;
     let client = Client::tracked(create_app()).unwrap();
     // `/texts/<name>` is a real route now, so it answers 400/401/405 instead of
-    // 404. Only `/users/me` (a later task) is still unimplemented.
+    // 404, and `/users/me` is implemented too: without a token it is 401, not 404.
     assert_eq!(
         client.req(Method::Delete, "/users/me").dispatch().status(),
-        Status::NotFound
+        Status::Unauthorized
     );
     for path in [
         "/ping",
@@ -477,5 +476,94 @@ fn http_delete_does_not_cross_users() {
     assert_eq!(
         secret.into_json::<Value>().unwrap(),
         json!({"data": "alice-only"})
+    );
+}
+
+#[test]
+fn http_delete_account_removes_the_user_its_texts_and_its_token() {
+    let client = Client::tracked(create_app()).unwrap();
+    let sign_up = |name: &str| -> String {
+        let account = json!({"username": name, "password": "password1"}).to_string();
+        assert_eq!(
+            client
+                .post("/users")
+                .header(ContentType::JSON)
+                .body(&account)
+                .dispatch()
+                .status(),
+            Status::Created
+        );
+        let login = client
+            .post("/sessions")
+            .header(ContentType::JSON)
+            .body(&account)
+            .dispatch()
+            .into_json::<Value>()
+            .unwrap();
+        format!("Bearer {}", login["data"]["token"].as_str().unwrap())
+    };
+    let alice = Header::new("Authorization", sign_up("alice"));
+    let bob = Header::new("Authorization", sign_up("bob"));
+
+    // alice stores one text, bob stores one under the same name.
+    for (auth, text) in [(&alice, "from-alice"), (&bob, "from-bob")] {
+        assert_eq!(
+            client
+                .put("/texts/note")
+                .header(ContentType::JSON)
+                .header(auth.clone())
+                .body(json!({"text": text}).to_string())
+                .dispatch()
+                .status(),
+            Status::Ok
+        );
+    }
+
+    // Without a token the route refuses; with alice's token it deletes the account.
+    assert_eq!(
+        client.req(Method::Delete, "/users/me").dispatch().status(),
+        Status::Unauthorized
+    );
+    let deleted = client.delete("/users/me").header(alice.clone()).dispatch();
+    assert_eq!(deleted.status(), Status::Ok);
+    assert_eq!(deleted.into_json::<Value>().unwrap(), json!({"data": null}));
+
+    // Every protected route now rejects that identity, including the text routes and
+    // both session routes.
+    for request in [
+        client.get("/texts"),
+        client.get("/texts/note"),
+        client.put("/texts/note"),
+        client.delete("/texts/note"),
+        client.delete("/sessions/current"),
+        client.delete("/users/me"),
+    ] {
+        assert_eq!(
+            request
+                .header(ContentType::JSON)
+                .header(alice.clone())
+                .body(json!({"text": "v"}).to_string())
+                .dispatch()
+                .status(),
+            Status::Unauthorized
+        );
+    }
+
+    // bob's text under the same name is untouched by alice's account deletion.
+    let bob_text = client.get("/texts/note").header(bob).dispatch();
+    assert_eq!(bob_text.status(), Status::Ok);
+    assert_eq!(
+        bob_text.into_json::<Value>().unwrap(),
+        json!({"data": "from-bob"})
+    );
+
+    // The username is free again, and the new account starts empty with a new token.
+    let fresh = Header::new("Authorization", sign_up("alice"));
+    let listing = client.get("/texts").header(fresh).dispatch();
+    assert_eq!(listing.status(), Status::Ok);
+    assert_eq!(listing.into_json::<Value>().unwrap(), json!({"data": []}));
+    assert_eq!(
+        client.get("/texts/note").header(alice).dispatch().status(),
+        Status::Unauthorized
     );
 }
