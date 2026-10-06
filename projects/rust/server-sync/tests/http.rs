@@ -299,3 +299,183 @@ fn http_text_round_trip_and_isolation() {
         Status::NotFound
     );
 }
+
+#[test]
+fn http_delete_removes_the_text_and_updates_the_listing() {
+    let client = Client::tracked(create_app()).unwrap();
+    let account = json!({"username": "alice", "password": "password1"}).to_string();
+    assert_eq!(
+        client
+            .post("/users")
+            .header(ContentType::JSON)
+            .body(&account)
+            .dispatch()
+            .status(),
+        Status::Created
+    );
+    let login = client
+        .post("/sessions")
+        .header(ContentType::JSON)
+        .body(&account)
+        .dispatch()
+        .into_json::<Value>()
+        .unwrap();
+    let auth = Header::new(
+        "Authorization",
+        format!("Bearer {}", login["data"]["token"].as_str().unwrap()),
+    );
+
+    assert_eq!(
+        client
+            .put("/texts/note")
+            .header(ContentType::JSON)
+            .header(auth.clone())
+            .body(json!({"text": "hello\nworld"}).to_string())
+            .dispatch()
+            .status(),
+        Status::Ok
+    );
+
+    // DELETE carries no body and identifies the owner by the token alone, so the
+    // request is sent with just the Authorization header.
+    let deleted = client.delete("/texts/note").header(auth.clone()).dispatch();
+    assert_eq!(deleted.status(), Status::Ok);
+    assert_eq!(deleted.into_json::<Value>().unwrap(), json!({"data": null}));
+
+    assert_eq!(
+        client
+            .get("/texts/note")
+            .header(auth.clone())
+            .dispatch()
+            .status(),
+        Status::NotFound
+    );
+    let listing = client.get("/texts").header(auth.clone()).dispatch();
+    assert_eq!(listing.status(), Status::Ok);
+    assert_eq!(listing.into_json::<Value>().unwrap(), json!({"data": []}));
+
+    // Deleting it again, and deleting a name that never existed, are both 404.
+    assert_eq!(
+        client
+            .delete("/texts/note")
+            .header(auth.clone())
+            .dispatch()
+            .status(),
+        Status::NotFound
+    );
+    assert_eq!(
+        client
+            .delete("/texts/missing")
+            .header(auth.clone())
+            .dispatch()
+            .status(),
+        Status::NotFound
+    );
+
+    // Without a token the request is refused, and a legal text that was never
+    // stored is 404 rather than 400.
+    assert_eq!(
+        client.delete("/texts/note").dispatch().status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client
+            .delete("/texts/bad.name")
+            .header(auth)
+            .dispatch()
+            .status(),
+        Status::BadRequest
+    );
+}
+
+#[test]
+fn http_delete_does_not_cross_users() {
+    let client = Client::tracked(create_app()).unwrap();
+    let sign_up = |name: &str| -> String {
+        let account = json!({"username": name, "password": "password1"}).to_string();
+        assert_eq!(
+            client
+                .post("/users")
+                .header(ContentType::JSON)
+                .body(&account)
+                .dispatch()
+                .status(),
+            Status::Created
+        );
+        let login = client
+            .post("/sessions")
+            .header(ContentType::JSON)
+            .body(&account)
+            .dispatch()
+            .into_json::<Value>()
+            .unwrap();
+        format!("Bearer {}", login["data"]["token"].as_str().unwrap())
+    };
+    let alice = Header::new("Authorization", sign_up("alice"));
+    let bob = Header::new("Authorization", sign_up("bob"));
+
+    // The same name, stored separately by each user.
+    for (auth, text) in [(&alice, "from-alice"), (&bob, "from-bob")] {
+        assert_eq!(
+            client
+                .put("/texts/note")
+                .header(ContentType::JSON)
+                .header(auth.clone())
+                .body(json!({"text": text}).to_string())
+                .dispatch()
+                .status(),
+            Status::Ok
+        );
+    }
+
+    // Alice deletes her own copy; bob's must survive under the same name.
+    assert_eq!(
+        client
+            .delete("/texts/note")
+            .header(alice.clone())
+            .dispatch()
+            .status(),
+        Status::Ok
+    );
+    assert_eq!(
+        client
+            .get("/texts/note")
+            .header(alice.clone())
+            .dispatch()
+            .status(),
+        Status::NotFound
+    );
+    let bob_text = client.get("/texts/note").header(bob.clone()).dispatch();
+    assert_eq!(bob_text.status(), Status::Ok);
+    assert_eq!(
+        bob_text.into_json::<Value>().unwrap(),
+        json!({"data": "from-bob"})
+    );
+
+    // Bob deleting a name only alice owns gets the same 404 a missing text gets,
+    // and that text is still readable afterwards.
+    assert_eq!(
+        client
+            .put("/texts/secret")
+            .header(ContentType::JSON)
+            .header(alice.clone())
+            .body(json!({"text": "alice-only"}).to_string())
+            .dispatch()
+            .status(),
+        Status::Ok
+    );
+    assert_eq!(
+        client
+            .delete("/texts/secret")
+            .header(bob)
+            .dispatch()
+            .status(),
+        Status::NotFound
+    );
+    let secret = client.get("/texts/secret").header(alice).dispatch();
+    assert_eq!(secret.status(), Status::Ok);
+    assert_eq!(
+        secret.into_json::<Value>().unwrap(),
+        json!({"data": "alice-only"})
+    );
+}

@@ -226,6 +226,24 @@ impl Service {
                 };
                 return (200, json!({"data": text}));
             }
+            // DELETE /texts/<name>: drop one of *this user's* texts.
+            //
+            // `remove` answers both questions at once: `Some(_)` means the text
+            // existed and is now gone, `None` means this user never had it. A text
+            // belonging to somebody else is therefore a plain 404 here — the same
+            // status and the same body as a missing one, so the reply cannot be used
+            // to learn which names other users own.
+            if method == "DELETE"
+                && let Some(text_key) = text_name(path)
+            {
+                if !valid_name(text_key, 64) {
+                    return error(400, "Invalid text name");
+                }
+                if user.texts.remove(text_key).is_none() {
+                    return error(404, "Text not found");
+                }
+                return (200, json!({"data": null}));
+            }
         }
         error(404, "Not found")
     }
@@ -423,6 +441,177 @@ mod tests {
                 .handle("GET", "/texts/missing", &Value::Null, &auth)
                 .0,
             404
+        );
+    }
+
+    #[test]
+    fn a_text_can_be_deleted_and_the_listing_follows() {
+        let service = Service::default();
+        let auth = sign_up(&service, &alice());
+        for name in ["b", "a", "c"] {
+            assert_eq!(
+                service
+                    .handle(
+                        "PUT",
+                        &format!("/texts/{name}"),
+                        &json!({"text": "v"}),
+                        &auth
+                    )
+                    .0,
+                200
+            );
+        }
+
+        // A text that exists is removed, and that is visible in both views.
+        assert_eq!(
+            service.handle("DELETE", "/texts/a", &Value::Null, &auth),
+            (200, json!({"data": null}))
+        );
+        assert_eq!(
+            service.handle("GET", "/texts/a", &Value::Null, &auth).0,
+            404
+        );
+        assert_eq!(
+            service.handle("GET", "/texts", &Value::Null, &auth),
+            (200, json!({"data": ["b", "c"]}))
+        );
+
+        // Deleting what is not there is a 404, and repeating it stays a 404
+        // instead of reporting the second attempt as a success.
+        assert_eq!(
+            service.handle("DELETE", "/texts/a", &Value::Null, &auth).0,
+            404
+        );
+        assert_eq!(
+            service
+                .handle("DELETE", "/texts/missing", &Value::Null, &auth)
+                .0,
+            404
+        );
+        assert_eq!(
+            service.handle("GET", "/texts", &Value::Null, &auth),
+            (200, json!({"data": ["b", "c"]}))
+        );
+
+        // An empty text is a stored value, so deleting it is a real deletion.
+        assert_eq!(
+            service
+                .handle("PUT", "/texts/empty", &json!({"text": ""}), &auth)
+                .0,
+            200
+        );
+        assert_eq!(
+            service
+                .handle("DELETE", "/texts/empty", &Value::Null, &auth)
+                .0,
+            200
+        );
+        assert_eq!(
+            service.handle("GET", "/texts/empty", &Value::Null, &auth).0,
+            404
+        );
+    }
+
+    #[test]
+    fn delete_is_rejected_for_the_right_reasons() {
+        let service = Service::default();
+        let auth = sign_up(&service, &alice());
+        assert_eq!(
+            service
+                .handle("PUT", "/texts/note", &json!({"text": "v"}), &auth)
+                .0,
+            200
+        );
+
+        // 401: no token, or a token that identifies nobody. Neither may remove
+        // anything.
+        assert_eq!(
+            service.handle("DELETE", "/texts/note", &Value::Null, "").0,
+            401
+        );
+        assert_eq!(
+            service
+                .handle("DELETE", "/texts/note", &Value::Null, "Bearer nope")
+                .0,
+            401
+        );
+
+        // 400: the name itself is not a legal text name. The check must run before
+        // the lookup, so this is 400 rather than 404.
+        for path in ["/texts/", "/texts/bad.name", "/texts/中文"] {
+            assert_eq!(
+                service.handle("DELETE", path, &Value::Null, &auth).0,
+                400,
+                "{path} should be rejected"
+            );
+        }
+
+        // The rejected requests above must not have touched the stored text.
+        assert_eq!(
+            service.handle("GET", "/texts/note", &Value::Null, &auth),
+            (200, json!({"data": "v"}))
+        );
+    }
+
+    #[test]
+    fn deleting_one_users_text_leaves_the_others_copy_alone() {
+        let service = Service::default();
+        let a = sign_up(&service, &alice());
+        let b = sign_up(
+            &service,
+            &json!({"username": "bob", "password": "password1"}),
+        );
+        for (auth, text) in [(&a, "from-alice"), (&b, "from-bob")] {
+            assert_eq!(
+                service
+                    .handle("PUT", "/texts/note", &json!({"text": text}), auth)
+                    .0,
+                200
+            );
+        }
+
+        assert_eq!(
+            service.handle("DELETE", "/texts/note", &Value::Null, &a),
+            (200, json!({"data": null}))
+        );
+
+        // Alice's copy is gone...
+        assert_eq!(
+            service.handle("GET", "/texts/note", &Value::Null, &a).0,
+            404
+        );
+        assert_eq!(
+            service.handle("GET", "/texts", &Value::Null, &a),
+            (200, json!({"data": []}))
+        );
+
+        // ...and bob's is untouched, under the very same name.
+        assert_eq!(
+            service.handle("GET", "/texts/note", &Value::Null, &b),
+            (200, json!({"data": "from-bob"}))
+        );
+        assert_eq!(
+            service.handle("GET", "/texts", &Value::Null, &b),
+            (200, json!({"data": ["note"]}))
+        );
+
+        // Bob deleting under a name alice owns is a plain 404, and alice's text is
+        // still there afterwards.
+        assert_eq!(
+            service
+                .handle("PUT", "/texts/secret", &json!({"text": "alice-only"}), &a)
+                .0,
+            200
+        );
+        assert_eq!(
+            service
+                .handle("DELETE", "/texts/secret", &Value::Null, &b)
+                .0,
+            404
+        );
+        assert_eq!(
+            service.handle("GET", "/texts/secret", &Value::Null, &a),
+            (200, json!({"data": "alice-only"}))
         );
     }
 
