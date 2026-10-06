@@ -50,25 +50,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut body = Value::Null;
         let (method, path) = match command.as_str() {
             "q" => break,
-            "ping" => ("GET", "/ping"),
-            "list" => ("GET", "/texts"),
-            "logout" => ("DELETE", "/sessions/current"),
+            "ping" => ("GET", "/ping".to_string()),
+            "list" => ("GET", "/texts".to_string()),
+            "logout" => ("DELETE", "/sessions/current".to_string()),
             "register" | "login" => {
                 body = json!({"username": input("username: ")?, "password": rpassword::prompt_password("password: ")?});
                 (
                     "POST",
                     if command == "register" {
-                        "/users"
+                        "/users".to_string()
                     } else {
-                        "/sessions"
+                        "/sessions".to_string()
                     },
                 )
             }
             "echo" => {
                 body = json!({ "text": read_text()? });
-                ("POST", "/echo")
+                ("POST", "/echo".to_string())
             }
-            "delete-user" | "put" | "get" | "delete" => {
+            // Both text commands name their target the same way: the path is built
+            // from the name the user types. The owner is never part of it, because
+            // the server derives that from the token.
+            "put" => {
+                let name = input("text name: ")?;
+                body = json!({ "text": read_text()? });
+                ("PUT", format!("/texts/{name}"))
+            }
+            "get" => {
+                let name = input("text name: ")?;
+                ("GET", format!("/texts/{name}"))
+            }
+            "delete-user" | "delete" => {
                 println!("This task is not implemented in the starting code yet.");
                 continue;
             }
@@ -81,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &client,
             &args.url,
             method.parse().unwrap(),
-            path,
+            &path,
             &token,
             if body.is_null() { None } else { Some(&body) },
         );
