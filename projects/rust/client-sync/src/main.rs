@@ -80,10 +80,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let name = input("text name: ")?;
                 ("GET", format!("/texts/{name}"))
             }
-            "delete-user" | "delete" => {
-                println!("This task is not implemented in the starting code yet.");
-                continue;
+            "delete" => {
+                let name = input("text name: ")?;
+                ("DELETE", format!("/texts/{name}"))
             }
+            "delete-user" => ("DELETE", "/users/me".to_string()),
             _ => {
                 println!("Unknown command.");
                 continue;
@@ -100,17 +101,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match result {
             Ok((status, value)) => {
                 println!("{status} {value}");
+                // `login` replaces the token; every other command either keeps the
+                // one it has or must forget it. That rule lives in `keep_token`, so
+                // it can be tested without a live server.
                 if command == "login"
                     && status == 200
                     && let Some(next) = value["data"]["token"].as_str()
                 {
                     token = next.into();
+                } else if !rm_client_sync::keep_token(&command, status) {
+                    token.clear();
                 }
                 if status == 401 {
                     println!("Please log in again.");
-                }
-                if status == 401 || (command == "logout" && status == 200) {
-                    token.clear();
                 }
             }
             Err(error) => eprintln!("Request failed: {error}"),

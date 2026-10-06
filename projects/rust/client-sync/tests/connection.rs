@@ -42,6 +42,69 @@ fn sends_http_authorization_and_preserves_error_status() {
     peer.join().unwrap();
 }
 
+/// Accept one connection, read the request head and body, and answer with
+/// `status`. Returns the head plus the raw body the client actually sent.
+fn send(status: &str, payload: &str) -> (std::thread::JoinHandle<(String, String)>, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        payload.len()
+    );
+    let response = format!("{head}{payload}");
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            head.push_str(&line);
+        }
+        let length: usize = head
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|value| value.trim().parse().unwrap())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body).unwrap();
+        stream.write_all(response.as_bytes()).unwrap();
+        (head, String::from_utf8(body).unwrap())
+    });
+    (peer, url)
+}
+
+#[test]
+fn delete_sends_the_token_and_no_body() {
+    let (peer, url) = send("401 Unauthorized", "expired");
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let result = exchange(&client, &url, Method::DELETE, "/texts/note", "sample", None).unwrap();
+    let (head, sent_body) = peer.join().unwrap();
+
+    let head = head.to_lowercase();
+    assert!(
+        head.starts_with("delete /texts/note http/1.1\r\n"),
+        "{head}"
+    );
+    assert!(head.contains("authorization: bearer sample\r\n"), "{head}");
+    // DELETE must not carry a request body, so there is nothing to decode.
+    assert_eq!(sent_body, "");
+    assert_eq!(result, (401, json!({"message": "expired"})));
+}
+
 #[test]
 fn echo_request_puts_the_text_in_a_json_body() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
