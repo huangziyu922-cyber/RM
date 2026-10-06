@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
 pub const ROUTES: &[(&str, &str)] = &[
@@ -43,16 +44,46 @@ pub fn route_error(method: &str, path: &str) -> Option<u16> {
     }
 }
 
+/// Login lifetime used when no `--token-ttl-seconds` is given.
+pub const DEFAULT_TOKEN_TTL_SECONDS: u64 = 300;
+
+/// A live session. The deadline is stored as an absolute instant rather than as a
+/// duration, so each token carries the moment it dies: a token's lifetime depends on
+/// when it was issued, never on the configuration or on how many requests it has
+/// served. That is what makes "fixed validity, not renewed by use" fall out of the
+/// data instead of needing a rule that could be forgotten.
+///
+/// `Instant` is deliberate. It is a monotonic clock, so it cannot jump when the
+/// system clock is adjusted — a token must not gain or lose time because someone
+/// changed the machine's time or a timezone/DST boundary passed.
+#[derive(Clone)]
+pub struct Token {
+    pub value: String,
+    pub expires_at: Instant,
+}
+
+impl Token {
+    pub fn is_expired(&self, now: Instant) -> bool {
+        now >= self.expires_at
+    }
+}
+
 pub struct User {
     pub salt: [u8; 16],
     pub digest: [u8; 32],
-    pub token: Option<String>,
+    pub token: Option<Token>,
     pub texts: BTreeMap<String, String>,
 }
 
-#[derive(Default)]
 pub struct Service {
     pub users: Mutex<BTreeMap<String, User>>,
+    /// Configured lifetime of a new session, in seconds.
+    pub token_ttl_seconds: u64,
+    /// Reads the current time. Defaults to the real monotonic clock; tests replace
+    /// it so that expiry can be exercised exactly instead of by sleeping. It is a
+    /// boxed closure rather than a plain function pointer so a test clock can keep
+    /// state (for example a counter it advances on demand).
+    pub clock: Box<dyn Fn() -> Instant + Send + Sync>,
     /// Test-only pause point, invoked while logging in *after* the password has
     /// been verified against a snapshot of the account but *before* the lock is
     /// taken again to record the session. It exists so a test can pin the exact
@@ -60,6 +91,39 @@ pub struct Service {
     /// a login) instead of hoping to hit it by timing. Never set outside tests.
     #[cfg(test)]
     pub(crate) after_password_check: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl Service {
+    /// Build a service with an explicit login lifetime.
+    pub fn new(token_ttl_seconds: u64) -> Self {
+        Self {
+            users: Mutex::new(BTreeMap::new()),
+            token_ttl_seconds,
+            clock: Box::new(Instant::now),
+            #[cfg(test)]
+            after_password_check: None,
+        }
+    }
+
+    fn now(&self) -> Instant {
+        (self.clock)()
+    }
+
+    /// Hand out a session for `user`, recording when it dies.
+    fn issue_token(&self, user: &mut User) -> Token {
+        let token = Token {
+            value: new_token(),
+            expires_at: self.now() + Duration::from_secs(self.token_ttl_seconds),
+        };
+        user.token = Some(token.clone());
+        token
+    }
+}
+
+impl Default for Service {
+    fn default() -> Self {
+        Self::new(DEFAULT_TOKEN_TTL_SECONDS)
+    }
 }
 
 pub fn error(status: u16, message: &str) -> (u16, Value) {
@@ -182,10 +246,14 @@ impl Service {
             if user.salt != salt || !bool::from(digest.ct_eq(&expected)) {
                 return error(401, "Invalid username or password");
             }
-            let token = new_token();
-            user.token = Some(token.clone());
-            // Later server task: record a deadline and include expires_in.
-            return (200, json!({"data": {"token": token}}));
+            let token = self.issue_token(user);
+            return (
+                200,
+                json!({"data": {
+                    "token": token.value,
+                    "expires_in": self.token_ttl_seconds,
+                }}),
+            );
         }
         // `/users/me` is protected too, but it is handled *before* the borrow below:
         // deleting an account must remove it from the map, and the per-user handle
@@ -194,10 +262,20 @@ impl Service {
             || text_name(path).is_some();
         if protected {
             let token = authorization.strip_prefix("Bearer ").unwrap_or("");
+            let now = self.now();
             let mut users = self.users.lock().unwrap();
+            // An expired token counts as no token at all, so it is filtered out here
+            // rather than in each protected branch. Every protected route therefore
+            // gets the same 401 for "expired" as for "unknown", which is what the
+            // protocol asks for.
             let name = users
                 .iter()
-                .find(|(_, user)| !token.is_empty() && user.token.as_deref() == Some(token))
+                .find(|(_, user)| {
+                    !token.is_empty()
+                        && user.token.as_ref().is_some_and(|session| {
+                            session.value == token && !session.is_expired(now)
+                        })
+                })
                 .map(|(name, _)| name.clone());
             let Some(name) = name else {
                 return error(401, "Login required");
@@ -366,6 +444,172 @@ mod tests {
 
     fn alice() -> Value {
         json!({"username": "alice", "password": "password1"})
+    }
+
+    /// A service whose clock the test controls, so expiry can be reached exactly
+    /// instead of by sleeping. Returns the handle used to move that clock.
+    ///
+    /// The `Arc` is leaked deliberately: `Service::clock` is a boxed closure with no
+    /// lifetime parameter, so whatever it reads has to outlive the service. One
+    /// allocation per test, and the alternative — an owned clock the test hands over
+    /// — would leave the test without a way to advance it.
+    fn leaked_clock() -> &'static Arc<Mutex<Instant>> {
+        Box::leak(Box::new(Arc::new(Mutex::new(Instant::now()))))
+    }
+
+    fn service_with_fake_clock(ttl_seconds: u64) -> (Service, Arc<Mutex<Instant>>) {
+        let clock = leaked_clock();
+        let mut service = Service::new(ttl_seconds);
+        // Both the service and the returned handle must read and write the *same*
+        // mutex, otherwise moving the clock would have no effect on the service.
+        service.clock = Box::new(move || *clock.lock().unwrap());
+        (service, Arc::clone(clock))
+    }
+
+    #[test]
+    fn a_login_reports_the_configured_lifetime() {
+        for ttl in [1, 300, 86400] {
+            let (service, _) = service_with_fake_clock(ttl);
+            assert_eq!(service.handle("POST", "/users", &alice(), "").0, 201);
+            let data = &service.handle("POST", "/sessions", &alice(), "").1["data"];
+            assert_eq!(data["expires_in"], json!(ttl), "ttl {ttl}");
+            assert!(data["token"].as_str().is_some_and(|t| !t.is_empty()));
+        }
+        // The default lifetime is the documented one.
+        assert_eq!(Service::default().token_ttl_seconds, 300);
+    }
+
+    #[test]
+    fn a_token_stops_working_once_its_lifetime_is_over() {
+        let (service, clock) = service_with_fake_clock(300);
+        let auth = sign_up(&service, &alice());
+        let token = auth.strip_prefix("Bearer ").unwrap().to_owned();
+
+        // A freshly issued token works.
+        assert_eq!(service.handle("GET", "/texts", &Value::Null, &auth).0, 200);
+
+        // Just before the deadline it still works...
+        {
+            let mut now = clock.lock().unwrap();
+            *now += Duration::from_secs(299);
+        }
+        assert_eq!(service.handle("GET", "/texts", &Value::Null, &auth).0, 200);
+
+        // ...and at the deadline it is expired. Every protected route must agree,
+        // including the ones that are not text routes.
+        {
+            let mut now = clock.lock().unwrap();
+            *now += Duration::from_secs(1);
+        }
+        for (method, path, body) in [
+            ("GET", "/texts", Value::Null),
+            ("GET", "/texts/note", Value::Null),
+            ("PUT", "/texts/note", json!({"text": "v"})),
+            ("DELETE", "/texts/note", Value::Null),
+            ("DELETE", "/sessions/current", Value::Null),
+            ("DELETE", "/users/me", Value::Null),
+        ] {
+            assert_eq!(
+                service.handle(method, path, &body, &auth).0,
+                401,
+                "{method} {path} should reject an expired token"
+            );
+        }
+
+        // The name is still taken and the password still works: only the session died.
+        assert_eq!(service.handle("POST", "/users", &alice(), "").0, 409);
+        assert_eq!(
+            service.handle("POST", "/sessions", &alice(), "").0,
+            200,
+            "expiry must not lock the account out"
+        );
+        // The old value is not resurrected by logging in again.
+        assert_eq!(service.handle("GET", "/texts", &Value::Null, &auth).0, 401);
+        let fresh = format!("Bearer {token}");
+        assert_eq!(service.handle("GET", "/texts", &Value::Null, &fresh).0, 401);
+    }
+
+    #[test]
+    fn using_a_token_does_not_extend_it() {
+        let (service, clock) = service_with_fake_clock(100);
+        let auth = sign_up(&service, &alice());
+
+        // Keep the session busy: each success must not push the deadline away.
+        for _ in 0..3 {
+            *clock.lock().unwrap() += Duration::from_secs(30);
+            assert_eq!(service.handle("GET", "/texts", &Value::Null, &auth).0, 200);
+        }
+
+        // 99s of the 100s are gone, so it is still alive...
+        *clock.lock().unwrap() += Duration::from_secs(9);
+        assert_eq!(service.handle("GET", "/texts", &Value::Null, &auth).0, 200);
+        // ...but the activity above did not buy it any extra time.
+        *clock.lock().unwrap() += Duration::from_secs(1);
+        assert_eq!(service.handle("GET", "/texts", &Value::Null, &auth).0, 401);
+    }
+
+    #[test]
+    fn expiry_does_not_stop_an_operation_that_already_passed_the_check() {
+        let (service, clock) = service_with_fake_clock(60);
+        assert_eq!(service.handle("POST", "/users", &alice(), "").0, 201);
+        let auth = {
+            let login = service.handle("POST", "/sessions", &alice(), "").1;
+            format!("Bearer {}", login["data"]["token"].as_str().unwrap())
+        };
+
+        // The check happens against the clock as it is when the request is handled.
+        // Moving the clock past the deadline makes the *next* request fail, while the
+        // stored data from before is untouched rather than rolled back.
+        assert_eq!(
+            service
+                .handle("PUT", "/texts/note", &json!({"text": "v1"}), &auth)
+                .0,
+            200
+        );
+        *clock.lock().unwrap() += Duration::from_secs(60);
+        assert_eq!(
+            service
+                .handle("PUT", "/texts/note", &json!({"text": "v2"}), &auth)
+                .0,
+            401
+        );
+        // The earlier write stands, and a fresh login can read it back.
+        let fresh_login = service.handle("POST", "/sessions", &alice(), "").1;
+        let fresh = format!("Bearer {}", fresh_login["data"]["token"].as_str().unwrap());
+        assert_eq!(
+            service.handle("GET", "/texts/note", &Value::Null, &fresh),
+            (200, json!({"data": "v1"}))
+        );
+    }
+
+    #[test]
+    fn logout_and_account_deletion_still_revoke_a_token_that_has_not_expired() {
+        let (service, _) = service_with_fake_clock(300);
+
+        // Logout revokes immediately, not at the deadline.
+        let auth = sign_up(&service, &alice());
+        assert_eq!(
+            service
+                .handle("DELETE", "/sessions/current", &Value::Null, &auth)
+                .0,
+            200
+        );
+        assert_eq!(service.handle("GET", "/texts", &Value::Null, &auth).0, 401);
+
+        // So does deleting the account.
+        let auth = sign_up_bob(&service);
+        assert_eq!(
+            service.handle("DELETE", "/users/me", &Value::Null, &auth),
+            (200, json!({"data": null}))
+        );
+        assert_eq!(service.handle("GET", "/texts", &Value::Null, &auth).0, 401);
+    }
+
+    fn sign_up_bob(service: &Service) -> String {
+        let account = json!({"username": "bob", "password": "password1"});
+        assert_eq!(service.handle("POST", "/users", &account, "").0, 201);
+        let login = service.handle("POST", "/sessions", &account, "").1;
+        format!("Bearer {}", login["data"]["token"].as_str().unwrap())
     }
 
     #[test]
@@ -755,7 +999,8 @@ mod tests {
             let old_token = service.users.lock().unwrap()["alice"]
                 .token
                 .clone()
-                .unwrap();
+                .unwrap()
+                .value;
             assert_eq!(
                 service
                     .handle(

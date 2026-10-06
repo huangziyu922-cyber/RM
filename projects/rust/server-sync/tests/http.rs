@@ -5,6 +5,7 @@ use rm_server_sync::{
 use rocket::http::{ContentType, Header, Method, Status};
 use rocket::local::blocking::Client;
 use serde_json::{Value, json};
+use std::sync::Mutex;
 
 #[test]
 fn app_uses_supplied_service() {
@@ -566,4 +567,94 @@ fn http_delete_account_removes_the_user_its_texts_and_its_token() {
         client.get("/texts/note").header(alice).dispatch().status(),
         Status::Unauthorized
     );
+}
+
+/// An `Instant` in a box that lives for the rest of the test binary, so it can be
+/// handed to `Service::clock`, which is a plain function pointer.
+fn fake_clock(start: std::time::Instant) -> &'static Mutex<std::time::Instant> {
+    Box::leak(Box::new(Mutex::new(start)))
+}
+
+#[test]
+fn http_login_reports_the_lifetime_and_expiry_is_enforced() {
+    let now = fake_clock(std::time::Instant::now());
+    let mut service = Service::new(30);
+    service.clock = Box::new(|| *now.lock().unwrap());
+    let client = Client::tracked(with_service(service)).unwrap();
+
+    let account = json!({"username": "alice", "password": "password1"}).to_string();
+    assert_eq!(
+        client
+            .post("/users")
+            .header(ContentType::JSON)
+            .body(&account)
+            .dispatch()
+            .status(),
+        Status::Created
+    );
+    let login = client
+        .post("/sessions")
+        .header(ContentType::JSON)
+        .body(&account)
+        .dispatch()
+        .into_json::<Value>()
+        .unwrap();
+    // `expires_in` is the configured lifetime, as a number.
+    assert_eq!(login["data"]["expires_in"], json!(30));
+    let auth = Header::new(
+        "Authorization",
+        format!("Bearer {}", login["data"]["token"].as_str().unwrap()),
+    );
+
+    // A protected route works, then stops working the moment the configured
+    // lifetime has passed, and reports the same 401 an unknown token gets.
+    assert_eq!(
+        client
+            .get("/texts")
+            .header(auth.clone())
+            .dispatch()
+            .status(),
+        Status::Ok
+    );
+    *now.lock().unwrap() += std::time::Duration::from_secs(30);
+    assert_eq!(
+        client
+            .get("/texts")
+            .header(auth.clone())
+            .dispatch()
+            .status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client
+            .put("/texts/note")
+            .header(ContentType::JSON)
+            .header(auth.clone())
+            .body(json!({"text": "v"}).to_string())
+            .dispatch()
+            .status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client
+            .delete("/sessions/current")
+            .header(auth.clone())
+            .dispatch()
+            .status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client.delete("/users/me").header(auth).dispatch().status(),
+        Status::Unauthorized
+    );
+
+    // Logging in again restores access, so expiry does not lock the account out.
+    let again = client
+        .post("/sessions")
+        .header(ContentType::JSON)
+        .body(&account)
+        .dispatch();
+    assert_eq!(again.status(), Status::Ok);
+    let body = again.into_json::<Value>().unwrap();
+    assert_eq!(body["data"]["expires_in"], json!(30));
 }
