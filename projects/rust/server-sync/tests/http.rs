@@ -136,17 +136,12 @@ fn http_input_and_routing() {
 fn unimplemented_routes_are_absent() {
     use rocket::http::Method;
     let client = Client::tracked(create_app()).unwrap();
-    for (method, path) in [
-        (Method::Delete, "/users/me"),
-        (Method::Put, "/texts/note"),
-        (Method::Get, "/texts/note"),
-        (Method::Delete, "/texts/note"),
-    ] {
-        assert_eq!(
-            client.req(method, path).dispatch().status(),
-            Status::NotFound
-        );
-    }
+    // `/texts/<name>` is a real route now, so it answers 400/401/405 instead of
+    // 404. Only `/users/me` (a later task) is still unimplemented.
+    assert_eq!(
+        client.req(Method::Delete, "/users/me").dispatch().status(),
+        Status::NotFound
+    );
     for path in [
         "/ping",
         "/echo",
@@ -154,6 +149,7 @@ fn unimplemented_routes_are_absent() {
         "/sessions",
         "/sessions/current",
         "/texts",
+        "/texts/note",
     ] {
         assert_eq!(
             client.patch(path).dispatch().status(),
@@ -224,5 +220,82 @@ fn http_echo_text_limit_boundary() {
             .dispatch()
             .status(),
         Status::PayloadTooLarge
+    );
+}
+
+#[test]
+fn http_text_round_trip_and_isolation() {
+    let client = Client::tracked(create_app()).unwrap();
+    let sign_up = |name: &str| -> String {
+        let account = json!({"username": name, "password": "password1"}).to_string();
+        assert_eq!(
+            client
+                .post("/users")
+                .header(ContentType::JSON)
+                .body(&account)
+                .dispatch()
+                .status(),
+            Status::Created
+        );
+        let login = client
+            .post("/sessions")
+            .header(ContentType::JSON)
+            .body(&account)
+            .dispatch()
+            .into_json::<Value>()
+            .unwrap();
+        format!("Bearer {}", login["data"]["token"].as_str().unwrap())
+    };
+    let alice = sign_up("alice");
+    let bob = sign_up("bob");
+
+    // The same name is created separately for each user.
+    for (auth, text) in [(&alice, "from-alice"), (&bob, "from-bob")] {
+        let response = client
+            .put("/texts/note")
+            .header(ContentType::JSON)
+            .header(Header::new("Authorization", auth.clone()))
+            .body(json!({"text": text}).to_string())
+            .dispatch();
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.into_json::<Value>().unwrap(),
+            json!({"data": null})
+        );
+    }
+
+    // Each token reads back its own text under the same name.
+    for (auth, expected) in [(&alice, "from-alice"), (&bob, "from-bob")] {
+        let response = client
+            .get("/texts/note")
+            .header(Header::new("Authorization", auth.clone()))
+            .dispatch();
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.into_json::<Value>().unwrap(),
+            json!({"data": expected})
+        );
+    }
+
+    let auth = Header::new("Authorization", alice.clone());
+    assert_eq!(
+        client.get("/texts/note").dispatch().status(),
+        Status::Unauthorized
+    );
+    assert_eq!(
+        client
+            .get("/texts/bad.name")
+            .header(auth.clone())
+            .dispatch()
+            .status(),
+        Status::BadRequest
+    );
+    assert_eq!(
+        client
+            .get("/texts/missing")
+            .header(auth)
+            .dispatch()
+            .status(),
+        Status::NotFound
     );
 }
